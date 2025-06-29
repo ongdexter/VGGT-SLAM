@@ -6,7 +6,7 @@
     <br />
   <br />
   <br />
-  <p align="center"><img src="https://github.mit.edu/storage/user/29705/files/c65b429a-fa17-42b0-b0c2-beacf9f8405d" alt="VGGT-SLAM" width="95%"/></p>
+  <p align="center"><img src="https://github.com/MIT-SPARK/VGGT-SLAM/tree/main/assets/vggt_slam_demo.gif" alt="VGGT-SLAM" width="95%"/></p>
   <p><strong><em>VGGT-SLAM: Dense RGB SLAM Optimized on the SL(4) Manifold</em></strong></p>
 
   <p align="center">
