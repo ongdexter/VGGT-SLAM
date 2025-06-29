@@ -14,7 +14,6 @@ __pycache__/
 *.so
 
 # ignore common logging files
-*.txt
 *.text
 *.pcd
 *.json
