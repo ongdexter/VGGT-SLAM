@@ -78,7 +78,7 @@ unzip office_loop.zip
 and then run the below command:
 
 ```
-python3 main.py --image_folder office_loop --max_loops 1 --vis_map --submap_size 64
+python3 main.py --image_folder office_loop --max_loops 1 --vis_map
 ```
 
 <p align="center">
