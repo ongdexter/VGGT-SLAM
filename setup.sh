@@ -7,8 +7,8 @@ pip3 install -r requirements.txt
 
 # 2. Clone and install modified GTSAM with SL(4) factors
 echo "Cloning and installing GTSAM..."
-git clone --depth 1 https://github.com/MIT-SPARK/gtsam_with_sl4.git gtsam
-cd gtsam
+git clone --depth 1 https://github.com/MIT-SPARK/gtsam_with_sl4.git
+cd gtsam_with_sl4
 mkdir -p build && cd build
 cmake .. \
     -DGTSAM_BUILD_PYTHON=ON \
