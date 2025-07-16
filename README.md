@@ -34,7 +34,13 @@
 <!-- We created a Hugging Face Space [here]() where you can quickly run an example of VGGT-SLAM. To install 
 VGGT-SLAM locally, which also enables a more detailed visualization built with Viser, use the following instructions.  -->
 
-Clone VGGT-SLAM:
+Make sure the following dependencies are installed before building the project:
+
+```
+sudo apt-get install git python3-pip libboost-all-dev cmake gcc g++ unzip
+```
+
+Then, clone VGGT-SLAM:
 
 ```
 git clone https://github.com/MIT-SPARK/VGGT-SLAM
