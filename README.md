@@ -25,6 +25,7 @@
 * [💻 Installation](#installation-of-vGGT-sLAM)
 * [🚀 Quick Start](#quick-start)
 * [📊 Running Evaluations](#running-evaluations)
+* [📄 Updates](#updates)
 * [📄 Paper Citation](#citation)
 
 ---
@@ -154,6 +155,10 @@ python evals/process_logs_7scenes.py 32
 By default, ever scene will be run for 5 trials, this can be changed inside the bash scripts.
 
 To visualize the maps as they being constructed, inside the bash scripts add `--vis_map`. This will update the viser map each time the submap is updated. 
+
+## Updates
+
+* August 2025: SL(4) optimization is integrated into the official GTSAM repo
 
 ## Acknowledgement
 
