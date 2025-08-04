@@ -133,11 +133,13 @@ class Solver:
         use_point_map: bool = False,
         visualize_global_map: bool = False,
         use_sim3: bool = False,
-        gradio_mode: bool = False):
+        gradio_mode: bool = False,
+        enable_loop_closure: bool = True):
         
         self.init_conf_threshold = init_conf_threshold
         self.use_point_map = use_point_map
         self.gradio_mode = gradio_mode
+        self.enable_loop_closure = enable_loop_closure
 
         if self.gradio_mode:
             self.viewer = TrimeshViewer()
@@ -238,6 +240,16 @@ class Solver:
             depth_map = pred_dict["depth"]  # (S, H, W, 1)
             conf = pred_dict["depth_conf"]  # (S, H, W)
             world_points = unproject_depth_map_to_point_map(depth_map, extrinsics_cam, intrinsics_cam)
+        
+        # scale the world points
+        scale = pred_dict.get("scale", 1.0)  # Default to 1.0 if not provided
+        world_points *= scale
+        
+        # pcd = o3d.geometry.PointCloud()
+        # pcd.points = o3d.utility.Vector3dVector(world_points.reshape(-1, 3))
+        # pcd.colors = o3d.utility.Vector3dVector((images.transpose(0, 2, 3, 1) * 255).reshape(-1, 3).astype(np.uint8) / 255.0)
+        # pcd = color_point_cloud_by_confidence(pcd, conf.reshape(-1), cmap='viridis')
+        # o3d.visualization.draw_geometries([pcd], window_name="Point Cloud")
 
         # Convert images from (S, 3, H, W) to (S, H, W, 3)
         # Then flatten everything for the point cloud
@@ -397,7 +409,11 @@ class Solver:
         new_submap.set_all_retrieval_vectors(self.image_retrieval.get_all_submap_embeddings(new_submap))
 
         # TODO implement this
-        detected_loops = self.image_retrieval.find_loop_closures(self.map, new_submap, max_loop_closures=max_loops)
+        if self.enable_loop_closure:
+            detected_loops = self.image_retrieval.find_loop_closures(
+                self.map, new_submap, max_loop_closures=max_loops)
+        else:
+            detected_loops = []
         if len(detected_loops) > 0:
             print(colored("detected_loops", "yellow"), detected_loops)
         retrieved_frames = self.map.get_frames_from_loops(detected_loops)
