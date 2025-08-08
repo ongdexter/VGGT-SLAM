@@ -45,15 +45,15 @@ class Viewer:
     def __init__(self, port: int = 8080):
         print(f"Starting viser server on port {port}")
 
-        self.server = viser.ViserServer(host="0.0.0.0", port=port)
-        self.server.gui.configure_theme(titlebar_content=None, control_layout="collapsible")
+        # self.server = viser.ViserServer(host="0.0.0.0", port=port)
+        # self.server.gui.configure_theme(titlebar_content=None, control_layout="collapsible")
 
-        # Global toggle for all frames and frustums
-        self.gui_show_frames = self.server.gui.add_checkbox(
-            "Show Cameras",
-            initial_value=True,
-        )
-        self.gui_show_frames.on_update(self._on_update_show_frames)
+        # # Global toggle for all frames and frustums
+        # self.gui_show_frames = self.server.gui.add_checkbox(
+        #     "Show Cameras",
+        #     initial_value=True,
+        # )
+        # self.gui_show_frames.on_update(self._on_update_show_frames)
 
         # Store frames and frustums by submap
         self.submap_frames: Dict[int, List[viser.FrameHandle]] = {}
@@ -134,12 +134,14 @@ class Solver:
         visualize_global_map: bool = False,
         use_sim3: bool = False,
         gradio_mode: bool = False,
-        enable_loop_closure: bool = True):
+        enable_loop_closure: bool = True,
+        enable_icp: bool = False):
         
         self.init_conf_threshold = init_conf_threshold
         self.use_point_map = use_point_map
         self.gradio_mode = gradio_mode
         self.enable_loop_closure = enable_loop_closure
+        self.enable_icp = enable_icp
 
         if self.gradio_mode:
             self.viewer = TrimeshViewer()
@@ -155,7 +157,8 @@ class Solver:
             from vggt_slam.graph import PoseGraph
         self.graph = PoseGraph()
 
-        self.image_retrieval = ImageRetrieval()
+        if self.enable_loop_closure:
+            self.image_retrieval = ImageRetrieval()
         self.current_working_submap = None
 
         self.first_edge = True
@@ -242,13 +245,16 @@ class Solver:
             world_points = unproject_depth_map_to_point_map(depth_map, extrinsics_cam, intrinsics_cam)
         
         # scale the world points
-        scale = pred_dict.get("scale", 1.0)  # Default to 1.0 if not provided
+        scale = pred_dict["scale"]
         world_points *= scale
+
+        # now override the extrinsics
+        extrinsics_cam = pred_dict["fused_extrinsics"]
         
         # pcd = o3d.geometry.PointCloud()
         # pcd.points = o3d.utility.Vector3dVector(world_points.reshape(-1, 3))
         # pcd.colors = o3d.utility.Vector3dVector((images.transpose(0, 2, 3, 1) * 255).reshape(-1, 3).astype(np.uint8) / 255.0)
-        # pcd = color_point_cloud_by_confidence(pcd, conf.reshape(-1), cmap='viridis')
+        # # pcd = color_point_cloud_by_confidence(pcd, conf.reshape(-1), cmap='viridis')
         # o3d.visualization.draw_geometries([pcd], window_name="Point Cloud")
 
         # Convert images from (S, 3, H, W) to (S, H, W, 3)
@@ -298,7 +304,7 @@ class Solver:
 
                 # apply scale factor to points and poses
                 world_points *= scale_factor
-                cam_to_world[:, 0:3, 3] *= scale_factor
+                # cam_to_world[:, 0:3, 3] *= scale_factor
             else:
                 H_relative = ransac_projective(current_pts[good_mask], self.prior_pcd[good_mask])
             
@@ -325,14 +331,62 @@ class Solver:
 
             # Add between factor.
             self.graph.add_between_factor(prior_pcd_num, new_pcd_num, H_relative, self.graph.relative_noise)
-
-            print("added between factor", prior_pcd_num, new_pcd_num, H_relative)
+            # print("added between factor", prior_pcd_num, new_pcd_num, H_relative)
 
         # Create and add submap.
         self.current_working_submap.set_reference_homography(H_w_submap)
         self.current_working_submap.add_all_poses(cam_to_world)
         self.current_working_submap.add_all_points(world_points, colors, conf, self.init_conf_threshold, intrinsics_cam)
         self.current_working_submap.set_conf_masks(conf) # TODO should make this work for point cloud conf as well
+
+        # Add Colored ICP-based constraint between submaps, if enabled
+        if not self.first_edge and self.enable_icp:
+            try:
+                # Build Open3D point clouds
+                pcd_prior = o3d.geometry.PointCloud()
+                pcd_prior.points = o3d.utility.Vector3dVector(
+                    prior_submap.get_points_in_world_frame()
+                )
+                pcd_prior.colors = o3d.utility.Vector3dVector(
+                    prior_submap.get_points_colors() / 255.0
+                )
+                pcd_current = o3d.geometry.PointCloud()
+                pcd_current.points = o3d.utility.Vector3dVector(
+                    self.current_working_submap.get_points_in_world_frame()
+                )
+                pcd_current.colors = o3d.utility.Vector3dVector(
+                    self.current_working_submap.get_points_colors() / 255.0
+                )
+                # Downsample and estimate normals for colored ICP
+                voxel_size = 0.2
+                prior_down = pcd_prior.voxel_down_sample(voxel_size)
+                current_down = pcd_current.voxel_down_sample(voxel_size)
+                prior_down.estimate_normals(
+                    o3d.geometry.KDTreeSearchParamHybrid(
+                        radius=voxel_size * 5, max_nn=30
+                    )
+                )
+                current_down.estimate_normals(
+                    o3d.geometry.KDTreeSearchParamHybrid(
+                        radius=voxel_size * 5, max_nn=30
+                    )
+                )
+
+                # get seed transformation from graph
+                seed_transformation = self.graph.get_homography(prior_pcd_num, new_pcd_num)
+
+                # reg = o3d.pipelines.registration.registration_colored_icp(
+                reg = o3d.pipelines.registration.registration_colored_icp(
+                    prior_down, current_down,
+                    max_correspondence_distance=voxel_size * 3,
+                    init=seed_transformation,
+                    estimation_method=TransformationEstimationForColoredICP)
+                T_colored = reg.transformation
+                self.graph.add_between_factor(
+                    prior_pcd_num, new_pcd_num, T_colored, self.graph.relative_noise
+                )
+            except Exception as e:
+                print(colored(f"Colored ICP error: {e}", "red"))
 
         # Add in loop closures if any were detected.
         for index, loop in enumerate(detected_loops):
@@ -404,9 +458,10 @@ class Solver:
         new_pcd_num = self.map.get_largest_key() + 1
         new_submap = Submap(new_pcd_num)
         # new_submap.add_all_frames(images)
-        new_submap.add_all_frames(images)
+        new_submap.add_all_frames(images.detach()cpu())
         new_submap.set_frame_ids(image_names)
-        new_submap.set_all_retrieval_vectors(self.image_retrieval.get_all_submap_embeddings(new_submap))
+        if self.enable_loop_closure:
+            new_submap.set_all_retrieval_vectors(self.image_retrieval.get_all_submap_embeddings(new_submap))
 
         # TODO implement this
         if self.enable_loop_closure:
@@ -426,7 +481,7 @@ class Solver:
 
             # TODO we don't really need to store the loop closure frame again, but this makes lookup easier for the visualizer.
             # We added the frame to the submap once before to get the retrieval vectors,
-            new_submap.add_all_frames(images)
+            new_submap.add_all_frames(images.detach().cpu())
 
         self.current_working_submap = new_submap
 
@@ -442,5 +497,9 @@ class Solver:
         for key in predictions.keys():
             if isinstance(predictions[key], torch.Tensor):
                 predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # remove batch dimension and convert to numpy
+
+        # Clear GPU cache to prevent memory accumulation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return predictions
