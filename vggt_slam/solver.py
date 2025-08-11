@@ -135,7 +135,8 @@ class Solver:
         use_sim3: bool = False,
         gradio_mode: bool = False,
         enable_loop_closure: bool = True,
-        enable_icp: bool = False):
+        enable_icp: bool = False,
+        overlap_window_size=1):
         
         self.init_conf_threshold = init_conf_threshold
         self.use_point_map = use_point_map
@@ -167,6 +168,8 @@ class Solver:
 
         self.prior_pcd = None
         self.prior_conf = None
+
+        self.overlap_window_size = overlap_window_size
 
         print("Starting viser server...")
 
@@ -290,20 +293,20 @@ class Solver:
             if self.use_sim3:
                 # Note we still use H and not T in variable names so we can share code with the Sim3 case, 
                 # and SIM3 and SE3 are also subsets of the SL4 group
-                R_temp = prior_submap.poses[prior_submap.get_last_non_loop_frame_index()][0:3,0:3]
-                t_temp = prior_submap.poses[prior_submap.get_last_non_loop_frame_index()][0:3,3]
+                R_temp = prior_submap.poses[-self.overlap_window_size][0:3,0:3]
+                t_temp = prior_submap.poses[-self.overlap_window_size][0:3,3]
                 T_temp = np.eye(4)
                 T_temp[0:3,0:3] = R_temp
                 T_temp[0:3,3] = t_temp
                 T_temp = np.linalg.inv(T_temp)
-                scale_factor = np.mean(np.linalg.norm((T_temp[0:3,0:3] @ self.prior_pcd[good_mask].T).T + T_temp[0:3,3], axis=1) / np.linalg.norm(current_pts[good_mask], axis=1))
-                print(colored("scale factor", 'green'), scale_factor)
+                # scale_factor = np.mean(np.linalg.norm((T_temp[0:3,0:3] @ self.prior_pcd[good_mask].T).T + T_temp[0:3,3], axis=1) / np.linalg.norm(current_pts[good_mask], axis=1))
+                # print(colored("scale factor", 'green'), scale_factor)
                 H_relative = np.eye(4)
                 H_relative[0:3,0:3] = R_temp
                 H_relative[0:3,3] = t_temp
 
                 # apply scale factor to points and poses
-                world_points *= scale_factor
+                # world_points *= scale_factor
                 # cam_to_world[:, 0:3, 3] *= scale_factor
             else:
                 H_relative = ransac_projective(current_pts[good_mask], self.prior_pcd[good_mask])
@@ -342,49 +345,107 @@ class Solver:
         # Add Colored ICP-based constraint between submaps, if enabled
         if not self.first_edge and self.enable_icp:
             try:
-                # Build Open3D point clouds
+                # Build Open3D point clouds in WORLD frame (already transformed by submap H_w_map)
                 pcd_prior = o3d.geometry.PointCloud()
-                pcd_prior.points = o3d.utility.Vector3dVector(
-                    prior_submap.get_points_in_world_frame()
-                )
-                pcd_prior.colors = o3d.utility.Vector3dVector(
-                    prior_submap.get_points_colors() / 255.0
-                )
+                pcd_prior.points = o3d.utility.Vector3dVector(prior_submap.get_points_in_world_frame())
+                pcd_prior.colors = o3d.utility.Vector3dVector(prior_submap.get_points_colors() / 255.0)
+
                 pcd_current = o3d.geometry.PointCloud()
-                pcd_current.points = o3d.utility.Vector3dVector(
-                    self.current_working_submap.get_points_in_world_frame()
-                )
-                pcd_current.colors = o3d.utility.Vector3dVector(
-                    self.current_working_submap.get_points_colors() / 255.0
-                )
-                # Downsample and estimate normals for colored ICP
-                voxel_size = 0.2
-                prior_down = pcd_prior.voxel_down_sample(voxel_size)
-                current_down = pcd_current.voxel_down_sample(voxel_size)
-                prior_down.estimate_normals(
-                    o3d.geometry.KDTreeSearchParamHybrid(
-                        radius=voxel_size * 5, max_nn=30
-                    )
-                )
-                current_down.estimate_normals(
-                    o3d.geometry.KDTreeSearchParamHybrid(
-                        radius=voxel_size * 5, max_nn=30
-                    )
-                )
+                pcd_current.points = o3d.utility.Vector3dVector(self.current_working_submap.get_points_in_world_frame())
+                pcd_current.colors = o3d.utility.Vector3dVector(self.current_working_submap.get_points_colors() / 255.0)
 
-                # get seed transformation from graph
-                seed_transformation = self.graph.get_homography(prior_pcd_num, new_pcd_num)
+                # Seed transform should map PRIOR -> CURRENT in the same (world) frame
+                H_seed = np.linalg.inv(prior_submap.get_reference_homography()) @ H_w_submap
 
-                # reg = o3d.pipelines.registration.registration_colored_icp(
-                reg = o3d.pipelines.registration.registration_colored_icp(
-                    prior_down, current_down,
-                    max_correspondence_distance=voxel_size * 3,
-                    init=seed_transformation,
-                    estimation_method=TransformationEstimationForColoredICP)
-                T_colored = reg.transformation
-                self.graph.add_between_factor(
-                    prior_pcd_num, new_pcd_num, T_colored, self.graph.relative_noise
-                )
+                # Multi-scale colored ICP with small motion clamps
+                voxel_radius = [[0.4, 0.4, 0.1],
+                                [0.2, 0.2, 0.1],
+                                [0.1, 0.1, 0.01]]
+                max_iter = [30, 20, 10]
+                rot_limits_deg = [10.0, 5.0, 2.0]   # per-level max rotation update
+                trans_limits = [5.0, 2.0, 1.0]   # per-level max translation update (meters)
+
+                def rodrigues_from_R(R):
+                    rvec, _ = cv2.Rodrigues(R)
+                    return rvec.reshape(3)
+
+                def R_from_rodrigues(rvec):
+                    R, _ = cv2.Rodrigues(rvec.reshape(3, 1))
+                    return R
+
+                def clamp_update(T_prev, T_new, rot_limit_deg, trans_limit):
+                    # Limit the delta = T_new * inv(T_prev)
+                    Delta = T_new @ np.linalg.inv(T_prev)
+                    R_delta = Delta[:3, :3]
+                    t_delta = Delta[:3, 3]
+
+                    rvec = rodrigues_from_R(R_delta)
+                    angle = np.linalg.norm(rvec)
+                    trans = np.linalg.norm(t_delta)
+
+                    scale_r = 1.0 if angle < 1e-12 else min(1.0, np.deg2rad(rot_limit_deg) / angle)
+                    scale_t = 1.0 if trans < 1e-12 else min(1.0, trans_limit / trans)
+                    scale = min(scale_r, scale_t)
+
+                    if scale < 1.0:
+                        rvec = rvec * scale
+                        t_delta = t_delta * scale
+                        R_limited = R_from_rodrigues(rvec)
+                        Delta_limited = np.eye(4)
+                        Delta_limited[:3, :3] = R_limited
+                        Delta_limited[:3, 3] = t_delta
+                        return Delta_limited @ T_prev
+                    else:
+                        return T_new
+
+                current_transformation = H_relative.copy()  # Start with the seed transformation
+                best_fitness = -1.0
+                best_rmse = np.inf
+                
+                for level in range(len(voxel_radius)):
+                    radius = voxel_radius[level]
+                    iterations = max_iter[level]
+
+                    source_down = pcd_prior.voxel_down_sample(radius)
+                    target_down = pcd_current.voxel_down_sample(radius)
+
+                    source_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius * 2, max_nn=30))
+                    target_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius * 2, max_nn=30))
+
+                    result = o3d.pipelines.registration.registration_colored_icp(
+                        source_down,
+                        target_down,
+                        radius,
+                        current_transformation,
+                        o3d.pipelines.registration.TransformationEstimationForColoredICP(),
+                        o3d.pipelines.registration.ICPConvergenceCriteria(
+                            relative_fitness=1e-3,
+                            relative_rmse=1e-3,
+                            max_iteration=iterations,
+                        ),
+                    )
+
+                    # Clamp motion around the seed to avoid wild jumps
+                    clamp_update = False
+                    if clamp_update:
+                        T_refined = clamp_update(current_transformation, result.transformation, rot_limits_deg[level], trans_limits[level])
+                    else:
+                        T_refined = result.transformation
+
+                    # Accept only if metrics do not degrade badly
+                    fitness_ok = (result.fitness >= best_fitness - 1e-6)
+                    rmse_ok = (result.inlier_rmse <= best_rmse * 1.25)
+
+                    if fitness_ok and rmse_ok:
+                        current_transformation = T_refined
+                        best_fitness = max(best_fitness, result.fitness)
+                        best_rmse = min(best_rmse, result.inlier_rmse)
+                    else:
+                        # Do not accept this level's update; keep previous
+                        pass
+
+                # current_transformation is PRIOR -> CURRENT small-step refined
+                self.graph.add_between_factor(prior_pcd_num, new_pcd_num, current_transformation, self.graph.relative_noise)
             except Exception as e:
                 print(colored(f"Colored ICP error: {e}", "red"))
 
@@ -458,7 +519,7 @@ class Solver:
         new_pcd_num = self.map.get_largest_key() + 1
         new_submap = Submap(new_pcd_num)
         # new_submap.add_all_frames(images)
-        new_submap.add_all_frames(images.detach()cpu())
+        new_submap.add_all_frames(images.detach().cpu())
         new_submap.set_frame_ids(image_names)
         if self.enable_loop_closure:
             new_submap.set_all_retrieval_vectors(self.image_retrieval.get_all_submap_embeddings(new_submap))
