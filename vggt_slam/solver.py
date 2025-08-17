@@ -136,6 +136,7 @@ class Solver:
         gradio_mode: bool = False,
         enable_loop_closure: bool = True,
         enable_icp: bool = False,
+        submap_size=5,
         overlap_window_size=1):
         
         self.init_conf_threshold = init_conf_threshold
@@ -169,6 +170,7 @@ class Solver:
         self.prior_pcd = None
         self.prior_conf = None
 
+        self.submap_size = submap_size
         self.overlap_window_size = overlap_window_size
 
         print("Starting viser server...")
@@ -252,7 +254,8 @@ class Solver:
         world_points *= scale
 
         # now override the extrinsics
-        extrinsics_cam = pred_dict["fused_extrinsics"]
+        # extrinsics_cam = pred_dict["fused_extrinsics"]
+        extrinsics_cam = pred_dict["scaled_extrinsics"]
         
         # pcd = o3d.geometry.PointCloud()
         # pcd.points = o3d.utility.Vector3dVector(world_points.reshape(-1, 3))
@@ -276,6 +279,7 @@ class Solver:
             self.first_edge = False
             self.prior_pcd = world_points[-1,...].reshape(-1, 3)
             self.prior_conf = conf[-1,...].reshape(-1)
+            self.prior_colors = colors[-1,...].reshape(-1, 3)
 
             # Add node to graph.
             H_w_submap = np.eye(4)
@@ -305,6 +309,25 @@ class Solver:
                 H_relative[0:3,0:3] = R_temp
                 H_relative[0:3,3] = t_temp
 
+                # H_relative is T_p_c
+
+                # submap 5, overlap 3
+                # 0 1-5
+                # 1 1-10 T_1_5
+                # 2 5-15 T_1_5 T_1_5
+                # 3 10-20 T_1_10 T_5_10
+
+                if new_pcd_num >= 2:
+                    prior2_pcd_num = self.map.get_largest_key() - 1
+                    prior2_submap = self.map.get_submap(prior2_pcd_num)
+                    window2_size = self.submap_size - self.overlap_window_size - 1
+                    print("prior2_pcd_num", prior2_pcd_num, "window2_size", window2_size)
+                    R_temp2 = prior2_submap.poses[-window2_size][:3,:3]
+                    t_temp2 = prior2_submap.poses[-window2_size][:3,3]
+                    H2_relative = np.eye(4)
+                    H2_relative[0:3,0:3] = R_temp2
+                    H2_relative[0:3,3] = t_temp2
+
                 # apply scale factor to points and poses
                 # world_points *= scale_factor
                 # cam_to_world[:, 0:3, 3] *= scale_factor
@@ -313,20 +336,27 @@ class Solver:
             
             H_w_submap = prior_submap.get_reference_homography() @ H_relative
 
-            # Visualize the point clouds
+            # # Visualize the point clouds
             # pcd1 = o3d.geometry.PointCloud()
             # pcd1.points = o3d.utility.Vector3dVector(self.prior_pcd)
             # pcd1 = color_point_cloud_by_confidence(pcd1, self.prior_conf)
             # pcd2 = o3d.geometry.PointCloud()
             # current_pts = world_points[0,...].reshape(-1, 3)
-            # points = apply_homography(H_relative, current_pts)
+            # # points = apply_homography(H_relative, current_pts)
+            # points = (H_relative @ np.hstack([current_pts, np.ones((current_pts.shape[0], 1))]).T).T[:, :3]
             # pcd2.points = o3d.utility.Vector3dVector(points)
             # # pcd2 = color_point_cloud_by_confidence(pcd2, conf_flat, cmap='jet')
             # o3d.visualization.draw_geometries([pcd1, pcd2])
 
+            self.icp_prior_pts = self.prior_pcd
+            self.icp_prior_colors = self.prior_colors
+            self.icp_current_pts = current_pts
+            self.icp_current_colors = colors[0,...].reshape(-1, 3)
+
             non_lc_frame = self.current_working_submap.get_last_non_loop_frame_index()
             pts_cam0_camn = world_points[non_lc_frame,...].reshape(-1, 3)
             self.prior_pcd = pts_cam0_camn
+            self.prior_colors = colors[non_lc_frame,...].reshape(-1, 3)
             self.prior_conf = conf[non_lc_frame,...].reshape(-1)
 
             # Add node to graph.
@@ -335,6 +365,8 @@ class Solver:
             # Add between factor.
             self.graph.add_between_factor(prior_pcd_num, new_pcd_num, H_relative, self.graph.relative_noise)
             # print("added between factor", prior_pcd_num, new_pcd_num, H_relative)
+            # if new_pcd_num >= 2:
+            #     self.graph.add_between_factor(prior2_pcd_num, new_pcd_num, H2_relative, self.graph.relative_noise)
 
         # Create and add submap.
         self.current_working_submap.set_reference_homography(H_w_submap)
@@ -347,58 +379,21 @@ class Solver:
             try:
                 # Build Open3D point clouds in WORLD frame (already transformed by submap H_w_map)
                 pcd_prior = o3d.geometry.PointCloud()
-                pcd_prior.points = o3d.utility.Vector3dVector(prior_submap.get_points_in_world_frame())
-                pcd_prior.colors = o3d.utility.Vector3dVector(prior_submap.get_points_colors() / 255.0)
+                pcd_prior.points = o3d.utility.Vector3dVector(self.icp_prior_pts)
+                pcd_prior.colors = o3d.utility.Vector3dVector(self.icp_prior_colors / 255.0)
 
                 pcd_current = o3d.geometry.PointCloud()
-                pcd_current.points = o3d.utility.Vector3dVector(self.current_working_submap.get_points_in_world_frame())
-                pcd_current.colors = o3d.utility.Vector3dVector(self.current_working_submap.get_points_colors() / 255.0)
-
-                # Seed transform should map PRIOR -> CURRENT in the same (world) frame
-                H_seed = np.linalg.inv(prior_submap.get_reference_homography()) @ H_w_submap
+                pcd_current.points = o3d.utility.Vector3dVector(self.icp_current_pts)
+                pcd_current.colors = o3d.utility.Vector3dVector(self.icp_current_colors / 255.0)
 
                 # Multi-scale colored ICP with small motion clamps
-                voxel_radius = [[0.4, 0.4, 0.1],
-                                [0.2, 0.2, 0.1],
-                                [0.1, 0.1, 0.01]]
+                # voxel_radius = [0.4, 0.3, 0.2]
+                voxel_radius = [0.2]
                 max_iter = [30, 20, 10]
                 rot_limits_deg = [10.0, 5.0, 2.0]   # per-level max rotation update
                 trans_limits = [5.0, 2.0, 1.0]   # per-level max translation update (meters)
 
-                def rodrigues_from_R(R):
-                    rvec, _ = cv2.Rodrigues(R)
-                    return rvec.reshape(3)
-
-                def R_from_rodrigues(rvec):
-                    R, _ = cv2.Rodrigues(rvec.reshape(3, 1))
-                    return R
-
-                def clamp_update(T_prev, T_new, rot_limit_deg, trans_limit):
-                    # Limit the delta = T_new * inv(T_prev)
-                    Delta = T_new @ np.linalg.inv(T_prev)
-                    R_delta = Delta[:3, :3]
-                    t_delta = Delta[:3, 3]
-
-                    rvec = rodrigues_from_R(R_delta)
-                    angle = np.linalg.norm(rvec)
-                    trans = np.linalg.norm(t_delta)
-
-                    scale_r = 1.0 if angle < 1e-12 else min(1.0, np.deg2rad(rot_limit_deg) / angle)
-                    scale_t = 1.0 if trans < 1e-12 else min(1.0, trans_limit / trans)
-                    scale = min(scale_r, scale_t)
-
-                    if scale < 1.0:
-                        rvec = rvec * scale
-                        t_delta = t_delta * scale
-                        R_limited = R_from_rodrigues(rvec)
-                        Delta_limited = np.eye(4)
-                        Delta_limited[:3, :3] = R_limited
-                        Delta_limited[:3, 3] = t_delta
-                        return Delta_limited @ T_prev
-                    else:
-                        return T_new
-
-                current_transformation = H_relative.copy()  # Start with the seed transformation
+                current_transformation = H_relative.copy() # T_c_p
                 best_fitness = -1.0
                 best_rmse = np.inf
                 
@@ -406,8 +401,10 @@ class Solver:
                     radius = voxel_radius[level]
                     iterations = max_iter[level]
 
-                    source_down = pcd_prior.voxel_down_sample(radius)
-                    target_down = pcd_current.voxel_down_sample(radius)
+                    # maps source -> target: T_t_s == T_p_c
+                    # so target is prior, source is current
+                    target_down = pcd_prior.voxel_down_sample(radius)
+                    source_down = pcd_current.voxel_down_sample(radius)
 
                     source_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius * 2, max_nn=30))
                     target_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius * 2, max_nn=30))
@@ -419,18 +416,13 @@ class Solver:
                         current_transformation,
                         o3d.pipelines.registration.TransformationEstimationForColoredICP(),
                         o3d.pipelines.registration.ICPConvergenceCriteria(
-                            relative_fitness=1e-3,
-                            relative_rmse=1e-3,
+                            relative_fitness=1e-1,
+                            relative_rmse=1,
                             max_iteration=iterations,
                         ),
                     )
 
-                    # Clamp motion around the seed to avoid wild jumps
-                    clamp_update = False
-                    if clamp_update:
-                        T_refined = clamp_update(current_transformation, result.transformation, rot_limits_deg[level], trans_limits[level])
-                    else:
-                        T_refined = result.transformation
+                    T_refined = result.transformation
 
                     # Accept only if metrics do not degrade badly
                     fitness_ok = (result.fitness >= best_fitness - 1e-6)
@@ -444,7 +436,12 @@ class Solver:
                         # Do not accept this level's update; keep previous
                         pass
 
-                # current_transformation is PRIOR -> CURRENT small-step refined
+                # visualize the ICP result T_p_c
+                # pcd_current.points = o3d.utility.Vector3dVector(
+                #     (current_transformation @ np.hstack([self.icp_current_pts, np.ones((self.icp_current_pts.shape[0], 1))]).T).T[:, :3])
+                # o3d.visualization.draw_geometries([pcd_prior, pcd_current])
+
+                # current_transformation is prior -> current
                 self.graph.add_between_factor(prior_pcd_num, new_pcd_num, current_transformation, self.graph.relative_noise)
             except Exception as e:
                 print(colored(f"Colored ICP error: {e}", "red"))
