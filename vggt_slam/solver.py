@@ -255,7 +255,7 @@ class Solver:
 
         # now override the extrinsics
         # extrinsics_cam = pred_dict["fused_extrinsics"]
-        extrinsics_cam = pred_dict["scaled_extrinsics"]
+        extrinsics_cam = pred_dict["scaled_extrinsics"] # w2c
         
         # pcd = o3d.geometry.PointCloud()
         # pcd.points = o3d.utility.Vector3dVector(world_points.reshape(-1, 3))
@@ -268,7 +268,7 @@ class Solver:
         colors = (images.transpose(0, 2, 3, 1) * 255).astype(np.uint8)  # now (S, H, W, 3)
 
         # Flatten
-        cam_to_world = closed_form_inverse_se3(extrinsics_cam)  # shape (S, 4, 4)
+        cam_to_world = closed_form_inverse_se3(extrinsics_cam)  # shape (S, 4, 4) c2w
 
         # estimate focal length from points
         points_in_first_cam = world_points[0,...]
@@ -297,7 +297,7 @@ class Solver:
             if self.use_sim3:
                 # Note we still use H and not T in variable names so we can share code with the Sim3 case, 
                 # and SIM3 and SE3 are also subsets of the SL4 group
-                R_temp = prior_submap.poses[-self.overlap_window_size][0:3,0:3]
+                R_temp = prior_submap.poses[-self.overlap_window_size][0:3,0:3] # c2w
                 t_temp = prior_submap.poses[-self.overlap_window_size][0:3,3]
                 T_temp = np.eye(4)
                 T_temp[0:3,0:3] = R_temp
